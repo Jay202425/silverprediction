@@ -11,25 +11,33 @@ warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Silver Price Forecast", layout="wide")
 st.title("🪙 Silver Price — Prophet Forecast")
-st.markdown("**Training:** last 4.5 years · **Test:** last 6 months · **Forecast:** next 1 year · **Preprocessing:** Log Transform")
+st.markdown(
+    "**Training:** last 4.5 years · **Test:** last 6 months · "
+    "**Forecast:** next 1 year · **Regressors:** Gold + USD Index · **Transform:** Log"
+)
 
-# ── 1. Download data ────────────────────────────────────────────────────
+# ── 1. Download silver + gold + USD index ───────────────────────────────
 @st.cache_data(ttl=3600)
 def load_data():
     end_date = datetime.now()
     start_date = end_date - timedelta(days=int(5 * 365.25))
-    raw = yf.download("SI=F", start=start_date, end=end_date, interval="1d")
-    if raw.empty:
-        return None
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-    df = raw[["Close"]].dropna().copy()
-    df = df.reset_index()
-    df.columns = ["ds", "y"]
-    df["ds"] = pd.to_datetime(df["ds"]).dt.tz_localize(None)
-    return df
+    tickers = {"SI=F": "silver", "GC=F": "gold", "DX-Y.NYB": "usd"}
+    frames = {}
+    for ticker, name in tickers.items():
+        raw = yf.download(ticker, start=start_date, end=end_date,
+                          interval="1d", progress=False)
+        if raw.empty:
+            return None
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        s = raw[["Close"]].dropna().reset_index()
+        s.columns = ["ds", name]
+        s["ds"] = pd.to_datetime(s["ds"]).dt.tz_localize(None)
+        frames[name] = s
+    df = frames["silver"].merge(frames["gold"], on="ds").merge(frames["usd"], on="ds")
+    return df.dropna().reset_index(drop=True)
 
-with st.spinner("Downloading silver price data from Yahoo Finance..."):
+with st.spinner("Downloading silver, gold & USD data..."):
     df = load_data()
 
 if df is None or df.empty:
@@ -38,82 +46,101 @@ if df is None or df.empty:
 
 st.success(f"Loaded **{len(df)}** daily records: {df['ds'].iloc[0].date()} → {df['ds'].iloc[-1].date()}")
 
-# ── 2. Train / Test split ──────────────────────────────────────────────
+# Log-transform all series
+df["y"]        = np.log(df["silver"])
+df["gold_log"] = np.log(df["gold"])
+df["usd_log"]  = np.log(df["usd"])
+
+# ── 2. Train / Test split ───────────────────────────────────────────────
 cutoff = df["ds"].iloc[-1] - timedelta(days=183)
-train = df[df["ds"] <= cutoff].copy()
-test = df[df["ds"] > cutoff].copy()
+train  = df[df["ds"] <= cutoff].copy()
+test   = df[df["ds"] >  cutoff].copy()
 
 col1, col2, col3 = st.columns(3)
 col1.metric("Training days", len(train))
-col2.metric("Test days", len(test))
-col3.metric("Total days", len(df))
+col2.metric("Test days",     len(test))
+col3.metric("Total days",    len(df))
 
-# ── 3. Preprocessing – Log Transform ────────────────────────────────────
-# Log transform stabilises variance for financial time series and lowers RMSE
-train["y_log"] = np.log(train["y"])
-test["y_log"] = np.log(test["y"])
-
-train_prophet = train[["ds", "y_log"]].rename(columns={"y_log": "y"})
-
-# ── 4. Fit Prophet ──────────────────────────────────────────────────────
+# ── 3. Fit Prophet with Gold + USD regressors ───────────────────────────
 @st.cache_data(ttl=3600)
-def fit_and_predict(_train_prophet, train_ds, test_ds):
+def fit_and_predict(_train, _test):
+    train_p = _train[["ds", "y", "gold_log", "usd_log"]].copy()
     model = Prophet(
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=True,
-        changepoint_prior_scale=0.4,    # higher = more flexible trend
-        seasonality_prior_scale=15,
-        seasonality_mode="additive",    # additive on log scale = multiplicative in price space
-        changepoint_range=0.95,
-        n_changepoints=50,
-    )
-    model.add_seasonality(name="monthly", period=30.5, fourier_order=8)
-    model.add_seasonality(name="quarterly", period=91.25, fourier_order=8)
-    model.add_seasonality(name="biannual", period=182.5, fourier_order=5)
-    model.fit(_train_prophet)
-
-    all_dates = pd.DataFrame({"ds": pd.concat([train_ds, test_ds]).values})
-    pred_all = model.predict(all_dates)
-    return model, pred_all
-
-@st.cache_data(ttl=3600)
-def forecast_future(_df):
-    full_prophet = _df[["ds", "y"]].copy()
-    full_prophet["y"] = np.log(full_prophet["y"])
-
-    model_full = Prophet(
-        daily_seasonality=False,
-        weekly_seasonality=True,
-        yearly_seasonality=True,
-        changepoint_prior_scale=0.4,
+        changepoint_prior_scale=0.5,
         seasonality_prior_scale=15,
         seasonality_mode="additive",
         changepoint_range=0.95,
         n_changepoints=50,
     )
-    model_full.add_seasonality(name="monthly", period=30.5, fourier_order=8)
+    model.add_regressor("gold_log", standardize=True)
+    model.add_regressor("usd_log",  standardize=True)
+    model.add_seasonality(name="monthly",   period=30.5,  fourier_order=8)
+    model.add_seasonality(name="quarterly", period=91.25, fourier_order=8)
+    model.add_seasonality(name="biannual",  period=182.5, fourier_order=5)
+    model.fit(train_p)
+    # Use actual gold/usd on test dates — valid backtest evaluation
+    all_df = pd.concat([_train, _test])[["ds", "y", "gold_log", "usd_log"]].copy()
+    return model.predict(all_df)
+
+@st.cache_data(ttl=3600)
+def forecast_future(_df):
+    def forecast_regressor(df_in, col):
+        m = Prophet(
+            daily_seasonality=False,
+            weekly_seasonality=True,
+            yearly_seasonality=True,
+            changepoint_prior_scale=0.3,
+            seasonality_mode="additive",
+            changepoint_range=0.95,
+        )
+        m.fit(df_in[["ds", col]].rename(columns={col: "y"}))
+        fut = m.make_future_dataframe(periods=365)
+        fc  = m.predict(fut)
+        return fc[["ds", "yhat"]].rename(columns={"yhat": col})
+
+    gold_fc = forecast_regressor(_df, "gold_log")
+    usd_fc  = forecast_regressor(_df, "usd_log")
+
+    full_p = _df[["ds", "y", "gold_log", "usd_log"]].copy()
+    model_full = Prophet(
+        daily_seasonality=False,
+        weekly_seasonality=True,
+        yearly_seasonality=True,
+        changepoint_prior_scale=0.5,
+        seasonality_prior_scale=15,
+        seasonality_mode="additive",
+        changepoint_range=0.95,
+        n_changepoints=50,
+    )
+    model_full.add_regressor("gold_log", standardize=True)
+    model_full.add_regressor("usd_log",  standardize=True)
+    model_full.add_seasonality(name="monthly",   period=30.5,  fourier_order=8)
     model_full.add_seasonality(name="quarterly", period=91.25, fourier_order=8)
-    model_full.add_seasonality(name="biannual", period=182.5, fourier_order=5)
-    model_full.fit(full_prophet)
+    model_full.add_seasonality(name="biannual",  period=182.5, fourier_order=5)
+    model_full.fit(full_p)
 
     future = model_full.make_future_dataframe(periods=365)
-    forecast = model_full.predict(future)
-    return forecast
+    future = future.merge(gold_fc, on="ds", how="left")
+    future = future.merge(usd_fc,  on="ds", how="left")
+    future["gold_log"] = future["gold_log"].ffill()
+    future["usd_log"]  = future["usd_log"].ffill()
+    return model_full.predict(future)
 
-with st.spinner("Fitting Prophet model on training data..."):
-    model, pred_all = fit_and_predict(train_prophet, train["ds"], test["ds"])
+with st.spinner("Fitting Prophet model with Gold & USD regressors (~30 s)..."):
+    pred_all = fit_and_predict(train, test)
 
-# ── 5. Evaluate on test set ────────────────────────────────────────────
+# ── 4. Evaluate on test set ────────────────────────────────────────────
 pred_test = pred_all[pred_all["ds"].isin(test["ds"])].copy()
 pred_test = pred_test.sort_values("ds").reset_index(drop=True)
 test_sorted = test.sort_values("ds").reset_index(drop=True)
 
-# Inverse log transform
 pred_test_price = np.exp(pred_test["yhat"].values)
 pred_test_lower = np.exp(pred_test["yhat_lower"].values)
 pred_test_upper = np.exp(pred_test["yhat_upper"].values)
-actual_test_price = test_sorted["y"].values
+actual_test_price = test_sorted["silver"].values
 
 rmse = np.sqrt(mean_squared_error(actual_test_price, pred_test_price))
 mape = np.mean(np.abs((actual_test_price - pred_test_price) / actual_test_price)) * 100
@@ -123,15 +150,15 @@ col1, col2 = st.columns(2)
 col1.metric("Test RMSE", f"${rmse:.2f}")
 col2.metric("Test MAPE", f"{mape:.2f}%")
 
-# ── 6. Forecast next 1 year ────────────────────────────────────────────
-with st.spinner("Forecasting next 1 year..."):
+# ── 5. Forecast next 1 year ────────────────────────────────────────────
+with st.spinner("Forecasting next 1 year with regressor projections..."):
     forecast = forecast_future(df.copy())
 
 forecast_price = np.exp(forecast["yhat"].values)
 forecast_lower = np.exp(forecast["yhat_lower"].values)
 forecast_upper = np.exp(forecast["yhat_upper"].values)
 
-# ── 7. Interactive Plotly chart ─────────────────────────────────────────
+# ── 6. Interactive Plotly chart ─────────────────────────────────────────
 st.markdown("---")
 st.subheader("Silver Price: Train · Test · Forecast")
 
@@ -139,7 +166,7 @@ fig = go.Figure()
 
 # Training data
 fig.add_trace(go.Scatter(
-    x=train["ds"], y=train["y"],
+    x=train["ds"], y=np.exp(train["y"]),
     mode="lines", name="Training Data (4.5 yrs)",
     line=dict(color="steelblue", width=1),
 ))
@@ -199,7 +226,7 @@ fig.update_layout(
 
 st.plotly_chart(fig, width='stretch')
 
-# ── 8. Forecast table ──────────────────────────────────────────────────
+# ── 7. Forecast table ──────────────────────────────────────────────────
 st.subheader("Forecast Data (Next 12 Months)")
 forecast_table = pd.DataFrame({
     "Date": future_dates.values,
