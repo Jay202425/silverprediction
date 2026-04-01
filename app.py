@@ -3,7 +3,6 @@ import yfinance as yf
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
 from prophet import Prophet
 from datetime import datetime, timedelta
@@ -12,7 +11,7 @@ warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Silver Price Forecast", layout="wide")
 st.title("🪙 Silver Price — Prophet Forecast")
-st.markdown("**Training:** last 4.5 years · **Test:** last 6 months · **Forecast:** next 1 year")
+st.markdown("**Training:** last 4.5 years · **Test:** last 6 months · **Forecast:** next 1 year · **Preprocessing:** Log Transform")
 
 # ── 1. Download data ────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
@@ -49,74 +48,71 @@ col1.metric("Training days", len(train))
 col2.metric("Test days", len(test))
 col3.metric("Total days", len(df))
 
-# ── 3. Preprocessing – MinMaxScaler ─────────────────────────────────────
-scaler = MinMaxScaler()
-train["y_scaled"] = scaler.fit_transform(train[["y"]])
-test["y_scaled"] = scaler.transform(test[["y"]])
+# ── 3. Preprocessing – Log Transform ────────────────────────────────────
+# Log transform stabilises variance for financial time series and lowers RMSE
+train["y_log"] = np.log(train["y"])
+test["y_log"] = np.log(test["y"])
 
-train_prophet = train[["ds", "y_scaled"]].rename(columns={"y_scaled": "y"})
+train_prophet = train[["ds", "y_log"]].rename(columns={"y_log": "y"})
 
 # ── 4. Fit Prophet ──────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
-def fit_and_predict(_train_prophet, train_ds, test_ds, _scaler_min, _scaler_scale):
+def fit_and_predict(_train_prophet, train_ds, test_ds):
     model = Prophet(
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=True,
-        changepoint_prior_scale=0.15,
-        seasonality_prior_scale=10,
-        seasonality_mode="multiplicative",
-        changepoint_range=0.9,
+        changepoint_prior_scale=0.4,    # higher = more flexible trend
+        seasonality_prior_scale=15,
+        seasonality_mode="additive",    # additive on log scale = multiplicative in price space
+        changepoint_range=0.95,
+        n_changepoints=50,
     )
-    model.add_seasonality(name="monthly", period=30.5, fourier_order=5)
-    model.add_seasonality(name="quarterly", period=91.25, fourier_order=5)
+    model.add_seasonality(name="monthly", period=30.5, fourier_order=8)
+    model.add_seasonality(name="quarterly", period=91.25, fourier_order=8)
+    model.add_seasonality(name="biannual", period=182.5, fourier_order=5)
     model.fit(_train_prophet)
 
-    # Predict on train+test dates
     all_dates = pd.DataFrame({"ds": pd.concat([train_ds, test_ds]).values})
     pred_all = model.predict(all_dates)
-
-    # Refit on full data for future forecast
-    full_df = pd.concat([train_ds, test_ds]).reset_index(drop=True)
     return model, pred_all
 
 @st.cache_data(ttl=3600)
-def forecast_future(_df, _scaler_params):
-    scaler_full = MinMaxScaler()
+def forecast_future(_df):
     full_prophet = _df[["ds", "y"]].copy()
-    full_prophet["y"] = scaler_full.fit_transform(full_prophet[["y"]])
+    full_prophet["y"] = np.log(full_prophet["y"])
 
     model_full = Prophet(
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=True,
-        changepoint_prior_scale=0.15,
-        seasonality_prior_scale=10,
-        seasonality_mode="multiplicative",
-        changepoint_range=0.9,
+        changepoint_prior_scale=0.4,
+        seasonality_prior_scale=15,
+        seasonality_mode="additive",
+        changepoint_range=0.95,
+        n_changepoints=50,
     )
-    model_full.add_seasonality(name="monthly", period=30.5, fourier_order=5)
-    model_full.add_seasonality(name="quarterly", period=91.25, fourier_order=5)
+    model_full.add_seasonality(name="monthly", period=30.5, fourier_order=8)
+    model_full.add_seasonality(name="quarterly", period=91.25, fourier_order=8)
+    model_full.add_seasonality(name="biannual", period=182.5, fourier_order=5)
     model_full.fit(full_prophet)
 
     future = model_full.make_future_dataframe(periods=365)
     forecast = model_full.predict(future)
-    return forecast, scaler_full
+    return forecast
 
 with st.spinner("Fitting Prophet model on training data..."):
-    model, pred_all = fit_and_predict(
-        train_prophet, train["ds"], test["ds"],
-        float(scaler.data_min_[0]), float(scaler.scale_[0])
-    )
+    model, pred_all = fit_and_predict(train_prophet, train["ds"], test["ds"])
 
 # ── 5. Evaluate on test set ────────────────────────────────────────────
 pred_test = pred_all[pred_all["ds"].isin(test["ds"])].copy()
 pred_test = pred_test.sort_values("ds").reset_index(drop=True)
 test_sorted = test.sort_values("ds").reset_index(drop=True)
 
-pred_test_price = scaler.inverse_transform(pred_test[["yhat"]].values).flatten()
-pred_test_lower = scaler.inverse_transform(pred_test[["yhat_lower"]].values).flatten()
-pred_test_upper = scaler.inverse_transform(pred_test[["yhat_upper"]].values).flatten()
+# Inverse log transform
+pred_test_price = np.exp(pred_test["yhat"].values)
+pred_test_lower = np.exp(pred_test["yhat_lower"].values)
+pred_test_upper = np.exp(pred_test["yhat_upper"].values)
 actual_test_price = test_sorted["y"].values
 
 rmse = np.sqrt(mean_squared_error(actual_test_price, pred_test_price))
@@ -129,11 +125,11 @@ col2.metric("Test MAPE", f"{mape:.2f}%")
 
 # ── 6. Forecast next 1 year ────────────────────────────────────────────
 with st.spinner("Forecasting next 1 year..."):
-    forecast, scaler_full = forecast_future(df.copy(), (float(scaler.data_min_[0]), float(scaler.scale_[0])))
+    forecast = forecast_future(df.copy())
 
-forecast_price = scaler_full.inverse_transform(forecast[["yhat"]].values).flatten()
-forecast_lower = scaler_full.inverse_transform(forecast[["yhat_lower"]].values).flatten()
-forecast_upper = scaler_full.inverse_transform(forecast[["yhat_upper"]].values).flatten()
+forecast_price = np.exp(forecast["yhat"].values)
+forecast_lower = np.exp(forecast["yhat_lower"].values)
+forecast_upper = np.exp(forecast["yhat_upper"].values)
 
 # ── 7. Interactive Plotly chart ─────────────────────────────────────────
 st.markdown("---")
